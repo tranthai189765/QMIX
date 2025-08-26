@@ -4,40 +4,48 @@ import numpy as np
 import torch
 import math
 import random
-
+import time
 def normalize_angle(angle):
     while angle > math.pi:
         angle -= 2 * math.pi
     while angle <= -math.pi:
         angle += 2 * math.pi
     return angle
-
+ 
 def compute_alpha(agent_pos, agent_dir, target_pos):
     dx, dy = target_pos[0] - agent_pos[0], target_pos[1] - agent_pos[1]
     angle_to_target = math.atan2(dy, dx)
     alpha = normalize_angle(angle_to_target - agent_dir)
-    return alpha
-
+    return math.degrees(alpha)
+ 
 def compute_theta(agent_pos, agent_view, seen_targets):
     """
-    calculate theta: the smallest angle for agent to cover all seen_targets
-    return a delta (how much we need to change viewing angle width)
+    Tính theta: góc bé nhất bao tất cả seen targets.
+    agent_pos: (x, y)
+    seen_targets: list[(x, y)]
     """
     if not seen_targets:
         return 0.0
+
+    # Tính góc tuyệt đối đến từng target
     angles = [math.atan2(t[1] - agent_pos[1], t[0] - agent_pos[0]) for t in seen_targets]
     angles.sort()
+
+    # Tính khoảng cách góc liên tiếp
     diffs = []
-    n = len(angles)
-    for i in range(n):
-        j = (i + 1) % n
+    for i in range(len(angles)):
+        j = (i + 1) % len(angles)
         diff = normalize_angle(angles[j] - angles[i])
         if diff < 0:
             diff += 2 * math.pi
         diffs.append(diff)
+
+    # Khoảng lớn nhất là vùng KHÔNG có target
     max_gap = max(diffs)
-    theta_needed = 2 * math.pi - max_gap
-    return agent_view - theta_needed
+    theta_needed = math.degrees(2 * math.pi - max_gap) + 5
+    # print("theta_needed = ", theta_needed)
+    return (theta_needed - agent_view)
+
 
 class CoorEnv(gym.Env):
     """
@@ -46,27 +54,36 @@ class CoorEnv(gym.Env):
     """
     metadata = {"render.modes": []}
     from typing import Optional
-
+ 
     def __init__(self, num_steps=10, seed: Optional[int] = None):
         super().__init__()
         base_env = mate.make('MultiAgentTracking-v0')
         base_env = mate.MultiCamera(base_env, target_agent=mate.GreedyTargetAgent(seed=0))
         self.base_env = base_env
-
+ 
         self.num_agents = base_env.num_teammates
         self.num_targets = base_env.num_opponents
         self.action_dim = 2 ** self.num_targets  # bitmask phân công targets cho từng agent
         self.action_space = gym.spaces.MultiDiscrete([self.action_dim] * self.num_agents)
-
+ 
         # Quan sát giữ nguyên theo base_env
         self.observation_space = self.base_env.observation_space
-
+ 
         self.num_steps = int(num_steps)
         self._t = 0
         self._last_obs = None
+        self._last_camera_action = []
+        self._previous_lib = [{'seen': False, 'pos': None} for _ in range(self.num_targets)]
+        # init last_action
+        for i in range(self.num_agents):
+            lo, hi = self._get_action_bounds_for_agent(i)
+            delta_alpha = random.uniform(float(lo[0]), float(hi[0]))
+            delta_theta = random.uniform(float(lo[1]), float(hi[1]))
+            self._last_camera_action.append([delta_alpha, delta_theta])
+
         if seed is not None:
             self.seed(seed)
-
+ 
     def seed(self, seed=None):
         random.seed(seed)
         np.random.seed(seed)
@@ -76,29 +93,40 @@ class CoorEnv(gym.Env):
         except Exception:
             pass
         return [seed]
-
+ 
     def reset(self):
         self._t = 0
         obs = self.base_env.reset()
         self._last_obs = obs
+        self._last_camera_action = []
+        self._previous_lib = [{'seen': False, 'pos': None} for _ in range(self.num_targets)]
+        # init last_action
+        for i in range(self.num_agents):
+            lo, hi = self._get_action_bounds_for_agent(i)
+            delta_alpha = random.uniform(float(lo[0]), float(hi[0]))
+            delta_theta = random.uniform(float(lo[1]), float(hi[1]))
+            self._last_camera_action.append([delta_alpha, delta_theta])
         return obs
-
-    def _extract_position(self, state):
+ 
+    def _extract_position(self, state, previous_lib):
         """
-        extract positions from state
+        extract positions from state and previous_lib
         @return:
             agent_positions + current view: [num_agents, 4]
             target_positions: [{'seen': bool, 'pos': (x, y) or None}, ...]
         """
         agent_positions = []
-        target_positions = [{'seen': False, 'pos': None} for _ in range(self.num_targets)]
+        # init target_positions = [{'seen': False, 'pos': None} for _ in range(self.num_targets)]
+        target_positions = previous_lib
         for i in range(self.num_agents):
             x = state[i][13]
             y = state[i][14]
             r_cos = state[i][16]
             r_sin = state[i][17]
             theta = state[i][18]  # FOV (view width) theo định dạng base_env
-            alpha = math.atan2(r_sin, r_cos)  # hướng quay
+            # print("current_theta = ", theta)
+            alpha = math.degrees(math.atan2(r_sin, r_cos))  # hướng quay
+            # print("alpha = ", alpha)
             agent_positions.append([x, y, theta, alpha])
             for j in range(self.num_targets):
                 base = 22 + 5 * j
@@ -107,7 +135,7 @@ class CoorEnv(gym.Env):
                     target_positions[j]['seen'] = True
                     target_positions[j]['pos'] = (state[i][base], state[i][base + 1])
         return agent_positions, target_positions
-
+ 
     def _get_action_bounds_for_agent(self, i):
         """
         Trả về (low, high) cho agent i.
@@ -120,7 +148,37 @@ class CoorEnv(gym.Env):
             # fallback: nếu không phải Tuple thì coi như Box chung
             lo, hi = self.base_env.action_space.low, self.base_env.action_space.high
         return lo, hi
-    
+ 
+    def _get_greedy_action(self):
+        """
+        Trả về action greedy cho tất cả agents.
+        Logic: agent nào quan sát được target nào thì sẽ track target đó.
+        Action là bitmask: bit j = 1 nếu agent track target j.
+        """
+        state = self._last_obs
+        actions = []
+ 
+        for i in range(self.num_agents):
+            action_mask = 0  # bitmask cho agent i
+            # Lấy thông tin vị trí + hướng (nếu cần dùng thêm)
+            x = state[i][13]
+            y = state[i][14]
+            r_cos = state[i][16]
+            r_sin = state[i][17]
+            theta = state[i][18]  # FOV width
+            alpha = math.atan2(r_sin, r_cos)  # hướng quay
+ 
+            # Kiểm tra từng target
+            for j in range(self.num_targets):
+                base = 22 + 5 * j
+                seen_flag = bool(state[i][base + 4])  # cờ =1 nếu thấy target j
+                if seen_flag:
+                    action_mask |= (1 << j)  # bật bit j (agent track target j)
+ 
+            actions.append(action_mask)
+ 
+        return actions
+   
     def step(self, actions):
         """
         Một action = phân công nhiệm vụ (bitmask target cho từng agent).
@@ -129,25 +187,26 @@ class CoorEnv(gym.Env):
         Trả về:
             next_state, mean_reward, done, info, steps_used
         """
-
+ 
         if isinstance(actions, torch.Tensor):
             actions = actions.cpu().numpy()
         actions = np.asarray(actions)
-
+ 
         # Chuyển bitmask -> targets cho từng agent
         targets_per_agent = []
         for a in actions:
             targets = [t for t in range(self.num_targets) if (int(a) >> t) & 1]
             targets_per_agent.append(targets)
-
+ 
         culminate_reward = 0.0
+        # print("target_per_agent = ", targets_per_agent)
         next_state = self._last_obs
-        done = False 
+        done = False
         camera_infos = None
-
+ 
         # Rollout tối đa num_steps bước
         for current_step in range(1, self.num_steps + 1):
-            agent_positions, target_positions = self._extract_position(next_state)
+            agent_positions, target_positions = self._extract_position(next_state, self._previous_lib)
             deltas = []
             for i, agent_targets in enumerate(targets_per_agent):
                 ax, ay, theta, alpha = agent_positions[i]
@@ -157,40 +216,52 @@ class CoorEnv(gym.Env):
                     avg_x = sum(x for x, y in seen_targets) / len(seen_targets)
                     avg_y = sum(y for x, y in seen_targets) / len(seen_targets)
                     avg_pos = (avg_x, avg_y)
-                    delta_alpha = compute_alpha((ax, ay), alpha, avg_pos)
+                    delta_alpha = compute_alpha((ax, ay), math.radians(alpha), avg_pos)
                     delta_theta = compute_theta((ax, ay), theta, seen_targets)
                 else:
-                    lo, hi = self._get_action_bounds_for_agent(i)
-                    delta_theta = random.uniform(float(lo[0]), float(hi[0]))
-                    delta_alpha = random.uniform(float(lo[1]), float(hi[1]))
-                deltas.append([delta_theta, delta_alpha])
+                    prob = np.random.rand() 
+                    if prob < 0.1:
+                        lo, hi = self._get_action_bounds_for_agent(i)
+                        delta_alpha = random.uniform(float(lo[0]), float(hi[0]))
+                        delta_theta = random.uniform(float(lo[1]), float(hi[1]))
+                    else:
+                        delta_alpha = self._last_camera_action[i][0]
+                        delta_theta = self._last_camera_action[i][1]
 
+                deltas.append([delta_alpha, delta_theta])
+ 
+            # print("deltas = ", deltas)
             next_state, reward, done, camera_infos = self.base_env.step(deltas)
+            self._last_camera_action = deltas
+            self._previous_lib = target_positions
             self._last_obs = next_state
-            culminate_reward += reward
-
+            culminate_reward += camera_infos[0]["coverage_rate"]
+ 
             if done:
                 break
-
+ 
         mean_reward = culminate_reward / current_step
-        return next_state, mean_reward, done, camera_infos, current_step
-
-
+        return next_state, mean_reward - 1.0, done, camera_infos, current_step
+ 
+ 
 if __name__ == "__main__":
-    env = CoorEnv(num_steps=10)
-    state = env.base_env.reset()
-
-    done = False
-    ep_reward = 0.0
-    ep_steps = 0
-
-    while not done and ep_steps < 50:  # ví dụ: 5 lần phân phối nhiệm vụ
-        # random phân phối nhiệm vụ
-        actions = np.random.randint(0, env.action_dim, size=(env.num_agents,))
-        print("actions = ", actions)
-        state, reward, done, info, used = env.step(state, actions)
-        ep_reward += reward
-        ep_steps += 1
-        print(f"Commander step {ep_steps}: reward={reward:.4f}, used={used} base steps, done={done}")
-
-    print(f"Episode finished: commander_steps={ep_steps}, total_reward={ep_reward:.4f}")
+    result = 0.0
+    for i in range(1):
+        env = CoorEnv(num_steps=1)
+        env.seed(i)
+        state = env.base_env.reset()
+        done = False
+        ep_reward = 0.0
+        ep_steps = 0
+        state = env.reset()
+        while not done: 
+            env.base_env.render()
+            actions = env._get_greedy_action()
+            state, reward, done, info, used = env.step(actions)
+            ep_reward += reward
+            ep_steps += 1
+    
+        print(f"Episode finished: commander_steps={ep_steps}, total_reward={ep_reward:.4f}")
+        result += ep_reward/ep_steps
+    
+    print("result = ", result)
