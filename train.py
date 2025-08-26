@@ -1,9 +1,9 @@
-from model_3 import QMix_Trainer 
+from model import QMix_Trainer 
 from coor_env import CoorEnv
 import random
 import numpy as np
 import torch
-from model_3 import ReplayBufferGRU
+from model import ReplayBufferGRU
 import time
 import argparse
 from torch.utils.tensorboard import SummaryWriter
